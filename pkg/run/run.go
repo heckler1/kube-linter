@@ -13,6 +13,9 @@ import (
 	"golang.stackrox.io/kube-linter/pkg/lintcontext"
 )
 
+// Reasonable default, could potentially make this configurable in the future
+const maxConcurrentLints = 8
+
 // CheckStatus is enum type.
 type CheckStatus string
 
@@ -51,25 +54,55 @@ func Run(lintCtxs []lintcontext.LintContext, registry checkregistry.CheckRegistr
 		result.Checks = append(result.Checks, instantiatedCheck.Spec)
 	}
 
+	var results = make(chan diagnostic.WithContext)
+	defer close(results)
+	var limit = make(chan struct{}, maxConcurrentLints)
+	var done = make(chan struct{})
+
 	for _, lintCtx := range lintCtxs {
 		for _, obj := range lintCtx.Objects() {
 			for _, check := range instantiatedChecks {
-				if !check.Matcher.Matches(obj.K8sObject.GetObjectKind().GroupVersionKind()) {
-					continue
-				}
-				if ignore.ObjectForCheck(obj.K8sObject.GetAnnotations(), check.Spec.Name) {
-					continue
-				}
-				diagnostics := check.Func(lintCtx, obj)
-				for _, d := range diagnostics {
-					result.Reports = append(result.Reports, diagnostic.WithContext{
-						Diagnostic:  d,
-						Check:       check.Spec.Name,
-						Remediation: check.Spec.Remediation,
-						Object:      obj,
-					})
-				}
+				go func(lintCtx lintcontext.LintContext, obj lintcontext.Object, check *instantiatedcheck.InstantiatedCheck) {
+					// Block waiting on a spot in the channel
+					limit <- struct{}{}
+					defer func() { <-limit }()
+
+					if !check.Matcher.Matches(obj.K8sObject.GetObjectKind().GroupVersionKind()) {
+						return
+					}
+					if ignore.ObjectForCheck(obj.K8sObject.GetAnnotations(), check.Spec.Name) {
+						return
+					}
+
+					diagnostics := check.Func(lintCtx, obj)
+					for _, d := range diagnostics {
+						results <- diagnostic.WithContext{
+							Diagnostic:  d,
+							Check:       check.Spec.Name,
+							Remediation: check.Spec.Remediation,
+							Object:      obj,
+						}
+					}
+				}(lintCtx, obj, check)
 			}
+		}
+	}
+
+	go func() {
+		for i := 0; i < maxConcurrentLints; i++ {
+			// wait until we can fill the whole channel, meaning the go routines are done
+			limit <- struct{}{}
+		}
+		done <- struct{}{}
+	}()
+
+chanLoop:
+	for {
+		select {
+		case diag := <-results:
+			result.Reports = append(result.Reports, diag)
+		case <-done:
+			break chanLoop
 		}
 	}
 
